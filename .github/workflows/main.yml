@@ -1,46 +1,207 @@
-name: "Common airport Checkin"
+import os
+import json
+from typing import Any, Dict, Optional
 
-on:
-  schedule:
-    - cron: "0 14 * * *"  # scheduled at 06:00 (UTC+8) everyday
-  workflow_dispatch:
+import requests
 
-env:
-  RUN_ENV: 'prod'
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    # if: github.ref == 'refs/heads/master'
+# ========== Env ==========
+URL = (os.environ.get("URL") or "").rstrip("/")  # 防止末尾 /
+CONFIG = os.environ.get("CONFIG", "")
 
-    steps:
-      - name: Checkout master
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-          # ref: master
+# 旧：Server酱（兼容保留）
+SCKEY = os.environ.get("SCKEY", "")
 
-      - name: Set up python
-        uses: actions/setup-python@v5
-        with:
-          python-version: 3.10.16
+# Telegram
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-      - name: Random sleep
-        if: github.event_name == 'schedule'
-        run: sleep $(shuf -i 10-300 -n 1)
+# 可选：已签到是否跳过推送（默认不跳过，保持原行为）
+# 设置为 "1"/"true"/"yes" 则跳过
+SKIP_PUSH_IF_ALREADY_CHECKED = (os.environ.get("SKIP_PUSH_IF_ALREADY_CHECKED", "") or "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      - name: Run sign
-        env:
-          URL: ${{ secrets.URL }}
-          SCKEY: ${{ secrets.SCKEY }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWD: ${{ secrets.PASSWD }}
-          CONFIG: ${{ secrets.CONFIG }}
-        run: |
-          python3 ./main.py
+LOGIN_URL = f"{URL}/auth/login"
+CHECK_URL = f"{URL}/user/checkin"
+
+
+# ========== Utils ==========
+def is_json_content_type(ct: str) -> bool:
+    ct = (ct or "").lower()
+    return "application/json" in ct or "text/json" in ct or ct.endswith("+json")
+
+
+def parse_json_or_debug(resp: requests.Response, tag: str) -> Dict[str, Any]:
+    """
+    尝试解析 JSON；如果返回不是 JSON（常见 HTML/空），给出清晰报错信息。
+    """
+    ct = resp.headers.get("content-type", "")
+    text = resp.text or ""
+
+    # 有些站点会 302/303 跳转到登录页
+    # allow_redirects=True 时最终可能是 200 的 HTML
+    if not text.strip():
+        raise RuntimeError(f"{tag}: empty body, HTTP {resp.status_code}, content-type={ct}")
+
+    # 优先用 .json()，失败再 debug
+    try:
+        data = resp.json()
+        if not isinstance(data, dict):
+            # 有些接口会返回 list/str，也算异常，方便排查
+            raise RuntimeError(f"{tag}: JSON is not object: {data!r}")
+        return data
+    except Exception:
+        # 如果 content-type 明显不是 json，很可能是 HTML/拦截页
+        head = text[:200].replace("\n", "\\n")
+        raise RuntimeError(
+            f"{tag}: non-JSON response, HTTP {resp.status_code}, content-type={ct}, body(head)={head!r}"
+        )
+
+
+def push_telegram(text: str) -> None:
+    """
+    Telegram Bot API 推送：严格校验 ok 字段，避免“HTTP 200 但业务失败”。
+    """
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+
+    api = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+
+    r = requests.post(api, json=payload, timeout=20)
+    r.raise_for_status()
+
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError(f"Telegram 返回非JSON：{(r.text or '')[:200]!r}")
+
+    if not data.get("ok"):
+        # Telegram 常见：HTTP 200 但 ok=false
+        raise RuntimeError(f"Telegram ok=false：{data!r}")
+
+
+def push_serverchan_compat(text: str) -> None:
+    """
+    兼容旧的 Server酱推送（可选保留）
+    """
+    if not SCKEY:
+        return
+    push_url = f"https://sctapi.ftqq.com/{SCKEY}.send"
+    params = {"title": "机场签到", "desp": text}
+    requests.post(url=push_url, params=params, timeout=20)
+
+
+def push_notify(text: str) -> None:
+    """
+    统一推送入口：优先 Telegram；没有则走 Server酱兼容。
+    """
+    if TG_BOT_TOKEN and TG_CHAT_ID:
+        push_telegram(text)
+        print("Telegram 推送成功")
+        return
+
+    if SCKEY:
+        push_serverchan_compat(text)
+        print("Server酱 推送成功(兼容)")
+        return
+
+    print("未配置推送（TG_BOT_TOKEN/TG_CHAT_ID 或 SCKEY 均为空），跳过推送。")
+
+
+# ========== Core ==========
+def build_headers() -> Dict[str, str]:
+    return {
+        "origin": URL,
+        "referer": f"{URL}/auth/login",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "accept": "application/json, text/plain, */*",
+        "x-requested-with": "XMLHttpRequest",
+    }
+
+
+def sign(order: int, user: str, pwd: str) -> None:
+    session = requests.Session()
+    headers = build_headers()
+    data = {"email": user, "passwd": pwd}
+
+    print(f"===账号{order}进行登录...===")
+    print(f"账号：{user}")
+
+    content_to_push: Optional[str] = None
+
+    try:
+        if not URL:
+            raise RuntimeError("URL 环境变量为空")
+
+        # 登录
+        r1 = session.post(LOGIN_URL, headers=headers, data=data, timeout=30, allow_redirects=True)
+        login_json = parse_json_or_debug(r1, "login")
+
+        login_msg = login_json.get("msg", "")
+        print(login_msg if login_msg else login_json)
+
+        # 有些面板 ret!=1 表示失败
+        if isinstance(login_json.get("ret"), int) and login_json.get("ret") != 1:
+            raise RuntimeError(f"登录失败：{login_json!r}")
+
+        # 签到
+        r2 = session.post(CHECK_URL, headers=headers, timeout=30, allow_redirects=True)
+        check_json = parse_json_or_debug(r2, "checkin")
+        msg = check_json.get("msg", "")
+        print(msg if msg else check_json)
+
+        content_to_push = f"账号：{user}\n签到结果：{msg if msg else check_json!r}"
+
+        # 可选：如果已签到就不推送
+        if SKIP_PUSH_IF_ALREADY_CHECKED and isinstance(msg, str) and ("已经签到" in msg or "已签到" in msg):
+            print("检测到已签到，按配置跳过推送。")
+        else:
+            push_notify(content_to_push)
+
+    except Exception as ex:
+        content_to_push = f"账号：{user}\n签到失败：{ex}"
+        print(content_to_push)
+
+        # 失败也尝试推送
+        try:
+            push_notify(content_to_push)
+        except Exception as ex2:
+            print(f"推送也失败：{ex2}")
+
+    print(f"===账号{order}签到结束===\n")
+
+
+# ========== Entry ==========
+if __name__ == "__main__":
+    configs = [line.strip() for line in (CONFIG or "").splitlines() if line.strip()]
+
+    # 兼容：如果有人仍用 EMAIL/PASSWD 传单账号（你的 workflow 里有注入，但旧逻辑没用到 :contentReference[oaicite:3]{index=3}）
+    email = (os.environ.get("EMAIL") or "").strip()
+    passwd = (os.environ.get("PASSWD") or "").strip()
+    if email and passwd:
+        # 若 CONFIG 为空，自动用 EMAIL/PASSWD
+        if not configs:
+            configs = [email, passwd]
+
+    if len(configs) == 0 or len(configs) % 2 != 0:
+        print("配置格式错误：CONFIG 需要按“邮箱\\n密码\\n邮箱\\n密码 ...”成对提供（或提供 EMAIL+PASSWD）")
+        raise SystemExit(1)
+
+    user_quantity = len(configs) // 2
+    for i in range(user_quantity):
+        user = configs[i * 2]
+        pwd = configs[i * 2 + 1]
+        sign(i, user, pwd)
